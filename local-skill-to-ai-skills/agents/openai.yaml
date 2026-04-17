@@ -1,0 +1,4 @@
+interface:
+  display_name: "共有skill移設"
+  short_description: "repo ローカル skill を ~/.ai-skills 正本へ移す"
+  default_prompt: "Use $local-skill-to-ai-skills to promote a repo-local skill into ~/.ai-skills and wire it for both Codex and Claude."

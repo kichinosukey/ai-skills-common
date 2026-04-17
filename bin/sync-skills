@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# sync-skills — materialize skill symlinks from skills.yaml into agent skill dirs.
+#
+# Usage:
+#   sync-skills [--dry-run] [--prune] [--root <path>]
+#
+# Resolves each `<namespace>/<skill>` entry to ~/.ai-skills/<namespace>/<skill>
+# and symlinks it under every target directory listed in skills.yaml.
+#
+# Dependencies: yq (preferred) or python3 (fallback).
+
+set -euo pipefail
+
+DRY_RUN=0
+PRUNE=0
+ROOT="$PWD"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --prune)   PRUNE=1; shift ;;
+    --root)    ROOT="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,12p' "$0"
+      exit 0
+      ;;
+    *)
+      echo "unknown arg: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+MANIFEST="$ROOT/skills.yaml"
+SKILLS_HOME="${AI_SKILLS_HOME:-$HOME/.ai-skills}"
+
+if [[ ! -f "$MANIFEST" ]]; then
+  echo "error: $MANIFEST not found" >&2
+  exit 1
+fi
+
+# --- YAML parsing: prefer yq, fall back to python3 -------------------------
+parse_manifest() {
+  # Emits two sections separated by "---":
+  #   targets: one dir per line
+  #   ---
+  #   skills: one "namespace/skill" per line
+  if command -v yq >/dev/null 2>&1; then
+    yq eval '.targets[].dir' "$MANIFEST"
+    echo "---"
+    yq eval '.skills[]' "$MANIFEST"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$MANIFEST" <<'PY'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+
+def yaml_load(s):
+    try:
+        import yaml  # PyYAML may be available
+        return yaml.safe_load(s)
+    except Exception:
+        pass
+    # Minimal fallback: handles the exact schema documented in docs/manifest.md
+    data = {"targets": [], "skills": []}
+    section = None
+    for raw in s.splitlines():
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        if re.match(r"^targets:\s*$", line):
+            section = "targets"; continue
+        if re.match(r"^skills:\s*$", line):
+            section = "skills"; continue
+        if re.match(r"^\w[\w-]*:", line):
+            section = None; continue
+        m = re.match(r"^\s*-\s*dir:\s*(.+?)\s*$", line)
+        if m and section == "targets":
+            data["targets"].append({"dir": m.group(1).strip().strip('"').strip("'")})
+            continue
+        m = re.match(r"^\s*-\s*(.+?)\s*$", line)
+        if m and section == "skills":
+            data["skills"].append(m.group(1).strip().strip('"').strip("'"))
+    return data
+
+data = yaml_load(text) or {}
+for t in data.get("targets", []) or []:
+    print(t["dir"] if isinstance(t, dict) else t)
+print("---")
+for sk in data.get("skills", []) or []:
+    print(sk)
+PY
+  else
+    echo "error: need yq or python3 to parse $MANIFEST" >&2
+    exit 1
+  fi
+}
+
+raw=$(parse_manifest)
+targets=()
+skills=()
+phase="t"
+while IFS= read -r line; do
+  if [[ "$line" == "---" ]]; then phase="s"; continue; fi
+  [[ -z "$line" ]] && continue
+  if [[ "$phase" == "t" ]]; then targets+=("$line"); else skills+=("$line"); fi
+done <<< "$raw"
+
+if [[ ${#targets[@]} -eq 0 ]]; then
+  echo "error: no targets in $MANIFEST" >&2
+  exit 1
+fi
+
+log() { echo "$@"; }
+run() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "[dry-run] $*"
+  else
+    eval "$@"
+  fi
+}
+
+# --- Create target dirs ---------------------------------------------------
+for t in "${targets[@]}"; do
+  full="$ROOT/$t"
+  if [[ ! -d "$full" ]]; then
+    run "mkdir -p '$full'"
+  fi
+done
+
+# --- Create symlinks ------------------------------------------------------
+declare -a managed_paths=()
+for entry in "${skills[@]}"; do
+  ns="${entry%%/*}"
+  name="${entry#*/}"
+  src="$SKILLS_HOME/$ns/$name"
+  if [[ ! -d "$src" ]]; then
+    echo "error: source missing: $src (manifest entry: $entry)" >&2
+    exit 1
+  fi
+  for t in "${targets[@]}"; do
+    dest="$ROOT/$t/$name"
+    managed_paths+=("$dest")
+    if [[ -L "$dest" ]]; then
+      current=$(readlink "$dest")
+      if [[ "$current" == "$src" ]]; then
+        continue
+      fi
+      run "rm '$dest' && ln -s '$src' '$dest'"
+    elif [[ -e "$dest" ]]; then
+      echo "error: $dest exists and is not a symlink — refuse to overwrite. Remove it manually." >&2
+      exit 1
+    else
+      run "ln -s '$src' '$dest'"
+    fi
+  done
+done
+
+# --- Prune stale symlinks -------------------------------------------------
+if [[ $PRUNE -eq 1 ]]; then
+  for t in "${targets[@]}"; do
+    full="$ROOT/$t"
+    [[ -d "$full" ]] || continue
+    while IFS= read -r -d '' link; do
+      keep=0
+      for m in "${managed_paths[@]}"; do
+        [[ "$link" == "$m" ]] && keep=1 && break
+      done
+      if [[ $keep -eq 0 ]]; then
+        target=$(readlink "$link" 2>/dev/null || true)
+        case "$target" in
+          "$SKILLS_HOME"/*) run "rm '$link'" ;;
+        esac
+      fi
+    done < <(find "$full" -maxdepth 1 -type l -print0)
+  done
+fi
+
+log "sync-skills: ${#skills[@]} skill(s) across ${#targets[@]} target dir(s)."
