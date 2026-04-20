@@ -9,9 +9,7 @@ version: 1
 targets:
   - dir: .agents/skills     # openclaw
   - dir: .codex/skills      # codex
-  - dir: .claude/skills     # claude code (skill entries)
-  - dir: .claude/commands   # claude code (slash commands)
-    format: command-wrapper
+  - dir: .claude/skills     # claude code
 skills:
   - mentalbase/backoffice-daily-triage-review
   - mentalbase/_backoffice-cdp-login-bootstrap
@@ -19,38 +17,20 @@ skills:
   - _common/session-slack-retro
 ```
 
-## Target formats
-
-Each target has a `format` (default `symlink`).
-
-- `symlink` — `sync-skills` creates `<dir>/<skill>` as a symlink to the source skill directory. The namespace prefix is dropped from the link name.
-- `command-wrapper` — `sync-skills` emits `<dir>/<skill>.md` wrapper files that invoke the skill via Claude Code's Skill tool. Enables `/<skill>` slash-command completion. Skills whose names start with `_` are treated as internal (callable only from other skills) and are **skipped** under this format.
-
-Wrapper content:
-
-```markdown
----
-description: <description from SKILL.md frontmatter>
----
-
-Use Skill `<skill-name>` with arguments: $ARGUMENTS
-```
-
 ## Resolution
 
-`<namespace>/<skill>` resolves to `~/.ai-skills/<namespace>/<skill>` (override via `AI_SKILLS_HOME`).
+`<namespace>/<skill>` resolves to `~/.ai-skills/<namespace>/<skill>` (override via `AI_SKILLS_HOME`). For every `targets[].dir` entry, `sync-skills` creates `<dir>/<skill>` as a symlink to the source directory. The namespace prefix is dropped from the link name.
 
 Name collisions across namespaces are an error — resolve by renaming one skill.
 
 ## git ignore
 
 - Track `skills.yaml`.
-- Do **not** track generated target contents (symlinks or command wrappers). Typical `.gitignore`:
+- Do **not** track `.agents/skills/`, `.codex/skills/`, `.claude/skills/` contents — they are generated symlinks. Typical `.gitignore`:
   ```
   .agents/skills/
   .codex/skills/
   .claude/skills/
-  .claude/commands/
   ```
 
 ## Repo-local skills (exception)
@@ -65,7 +45,5 @@ sync-skills [--dry-run] [--prune] [--root <path>]
 
 - Reads `<root>/skills.yaml` (default `$PWD`).
 - Creates missing target dirs, symlinks every manifest skill, skips already-correct links.
-- `--prune` removes stale artifacts under the target dirs:
-  - `symlink` targets: symlinks into `~/.ai-skills` not in the manifest.
-  - `command-wrapper` targets: `.md` files matching the wrapper sentinel (`Use Skill ` … ` with arguments: $ARGUMENTS`) not in the manifest.
+- `--prune` removes symlinks under the target dirs that point into `~/.ai-skills` but are not in the manifest.
 - Refuses to overwrite an existing real file/dir at the link path (manual cleanup required).

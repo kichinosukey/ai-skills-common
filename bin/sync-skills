@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
-# sync-skills — materialize skill artifacts from skills.yaml into agent skill dirs.
+# sync-skills — materialize skill symlinks from skills.yaml into agent skill dirs.
 #
 # Usage:
 #   sync-skills [--dry-run] [--prune] [--root <path>]
 #
-# Resolves each `<namespace>/<skill>` entry to ~/.ai-skills/<namespace>/<skill>.
-# Each target has a format:
-#   - symlink          (default): symlink the source skill dir into target dir
-#   - command-wrapper: emit <target>/<skill>.md wrappers that invoke the skill
-#                      via Skill tool. Skills whose names start with "_" are
-#                      skipped (internal skills, not user-invocable).
+# Resolves each `<namespace>/<skill>` entry to ~/.ai-skills/<namespace>/<skill>
+# and symlinks it under every target directory listed in skills.yaml.
 #
 # Dependencies: yq (preferred) or python3 (fallback).
 
@@ -25,7 +21,7 @@ while [[ $# -gt 0 ]]; do
     --prune)   PRUNE=1; shift ;;
     --root)    ROOT="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,14p' "$0"
+      sed -n '2,12p' "$0"
       exit 0
       ;;
     *)
@@ -44,13 +40,13 @@ if [[ ! -f "$MANIFEST" ]]; then
 fi
 
 # --- YAML parsing: prefer yq, fall back to python3 -------------------------
-# Output format:
-#   <dir>\t<format>       (one per target)
-#   ---
-#   <namespace>/<skill>   (one per skill)
 parse_manifest() {
+  # Emits two sections separated by "---":
+  #   targets: one dir per line
+  #   ---
+  #   skills: one "namespace/skill" per line
   if command -v yq >/dev/null 2>&1; then
-    yq eval '.targets[] | (.dir + "\t" + (.format // "symlink"))' "$MANIFEST"
+    yq eval '.targets[].dir' "$MANIFEST"
     echo "---"
     yq eval '.skills[]' "$MANIFEST"
   elif command -v python3 >/dev/null 2>&1; then
@@ -62,47 +58,35 @@ with open(path) as f:
 
 def yaml_load(s):
     try:
-        import yaml
+        import yaml  # PyYAML may be available
         return yaml.safe_load(s)
     except Exception:
         pass
-    # Minimal fallback for the schema documented in docs/manifest.md
+    # Minimal fallback: handles the exact schema documented in docs/manifest.md
     data = {"targets": [], "skills": []}
     section = None
-    current_target = None
     for raw in s.splitlines():
         line = raw.rstrip()
         if not line or line.lstrip().startswith("#"):
             continue
         if re.match(r"^targets:\s*$", line):
-            section = "targets"; current_target = None; continue
+            section = "targets"; continue
         if re.match(r"^skills:\s*$", line):
-            section = "skills"; current_target = None; continue
-        if re.match(r"^\w[\w-]*:", line) and not line.startswith(" "):
-            section = None; current_target = None; continue
-        if section == "targets":
-            m = re.match(r"^\s*-\s*dir:\s*(.+?)\s*$", line)
-            if m:
-                current_target = {"dir": m.group(1).strip().strip('"').strip("'"),
-                                  "format": "symlink"}
-                data["targets"].append(current_target)
-                continue
-            m = re.match(r"^\s+format:\s*(.+?)\s*$", line)
-            if m and current_target is not None:
-                current_target["format"] = m.group(1).strip().strip('"').strip("'")
-                continue
-        if section == "skills":
-            m = re.match(r"^\s*-\s*(.+?)\s*$", line)
-            if m:
-                data["skills"].append(m.group(1).strip().strip('"').strip("'"))
+            section = "skills"; continue
+        if re.match(r"^\w[\w-]*:", line):
+            section = None; continue
+        m = re.match(r"^\s*-\s*dir:\s*(.+?)\s*$", line)
+        if m and section == "targets":
+            data["targets"].append({"dir": m.group(1).strip().strip('"').strip("'")})
+            continue
+        m = re.match(r"^\s*-\s*(.+?)\s*$", line)
+        if m and section == "skills":
+            data["skills"].append(m.group(1).strip().strip('"').strip("'"))
     return data
 
 data = yaml_load(text) or {}
 for t in data.get("targets", []) or []:
-    if isinstance(t, dict):
-        print(f"{t['dir']}\t{t.get('format', 'symlink')}")
-    else:
-        print(f"{t}\tsymlink")
+    print(t["dir"] if isinstance(t, dict) else t)
 print("---")
 for sk in data.get("skills", []) or []:
     print(sk)
@@ -114,25 +98,16 @@ PY
 }
 
 raw=$(parse_manifest)
-target_dirs=()
-target_formats=()
+targets=()
 skills=()
 phase="t"
 while IFS= read -r line; do
   if [[ "$line" == "---" ]]; then phase="s"; continue; fi
   [[ -z "$line" ]] && continue
-  if [[ "$phase" == "t" ]]; then
-    dir="${line%%$'\t'*}"
-    fmt="${line#*$'\t'}"
-    [[ "$fmt" == "$line" ]] && fmt="symlink"
-    target_dirs+=("$dir")
-    target_formats+=("$fmt")
-  else
-    skills+=("$line")
-  fi
+  if [[ "$phase" == "t" ]]; then targets+=("$line"); else skills+=("$line"); fi
 done <<< "$raw"
 
-if [[ ${#target_dirs[@]} -eq 0 ]]; then
+if [[ ${#targets[@]} -eq 0 ]]; then
   echo "error: no targets in $MANIFEST" >&2
   exit 1
 fi
@@ -147,142 +122,59 @@ run() {
 }
 
 # --- Create target dirs ---------------------------------------------------
-for t in "${target_dirs[@]}"; do
+for t in "${targets[@]}"; do
   full="$ROOT/$t"
   if [[ ! -d "$full" ]]; then
     run "mkdir -p '$full'"
   fi
 done
 
-# --- Extract description from SKILL.md frontmatter ------------------------
-skill_description() {
-  local skill_md="$1/SKILL.md"
-  [[ -f "$skill_md" ]] || { echo ""; return; }
-  awk '
-    /^---[[:space:]]*$/ { fm++; next }
-    fm == 1 && /^description:/ {
-      sub(/^description:[[:space:]]*/, "")
-      # Strip surrounding quotes if present
-      gsub(/^"|"$/, "")
-      gsub(/^'\''|'\''$/, "")
-      print
-      exit
-    }
-  ' "$skill_md"
-}
-
-# --- Process each (target, skill) pair -----------------------------------
+# --- Create symlinks ------------------------------------------------------
 declare -a managed_paths=()
-for i in "${!target_dirs[@]}"; do
-  t="${target_dirs[$i]}"
-  fmt="${target_formats[$i]}"
-  for entry in "${skills[@]}"; do
-    ns="${entry%%/*}"
-    name="${entry#*/}"
-    src="$SKILLS_HOME/$ns/$name"
-    if [[ ! -d "$src" ]]; then
-      echo "error: source missing: $src (manifest entry: $entry)" >&2
+for entry in "${skills[@]}"; do
+  ns="${entry%%/*}"
+  name="${entry#*/}"
+  src="$SKILLS_HOME/$ns/$name"
+  if [[ ! -d "$src" ]]; then
+    echo "error: source missing: $src (manifest entry: $entry)" >&2
+    exit 1
+  fi
+  for t in "${targets[@]}"; do
+    dest="$ROOT/$t/$name"
+    managed_paths+=("$dest")
+    if [[ -L "$dest" ]]; then
+      current=$(readlink "$dest")
+      if [[ "$current" == "$src" ]]; then
+        continue
+      fi
+      run "rm '$dest' && ln -s '$src' '$dest'"
+    elif [[ -e "$dest" ]]; then
+      echo "error: $dest exists and is not a symlink — refuse to overwrite. Remove it manually." >&2
       exit 1
+    else
+      run "ln -s '$src' '$dest'"
     fi
-
-    case "$fmt" in
-      symlink)
-        dest="$ROOT/$t/$name"
-        managed_paths+=("$dest")
-        if [[ -L "$dest" ]]; then
-          current=$(readlink "$dest")
-          if [[ "$current" == "$src" ]]; then
-            continue
-          fi
-          run "rm '$dest' && ln -s '$src' '$dest'"
-        elif [[ -e "$dest" ]]; then
-          echo "error: $dest exists and is not a symlink — refuse to overwrite. Remove it manually." >&2
-          exit 1
-        else
-          run "ln -s '$src' '$dest'"
-        fi
-        ;;
-      command-wrapper)
-        # Skip internal skills (underscore prefix) — not user-invocable
-        if [[ "$name" == _* ]]; then
-          continue
-        fi
-        dest="$ROOT/$t/$name.md"
-        managed_paths+=("$dest")
-        desc=$(skill_description "$src")
-        [[ -z "$desc" ]] && desc="Run skill $name."
-        # Escape any single quotes in desc for safe heredoc usage
-        tmp=$(mktemp)
-        {
-          printf -- '---\n'
-          printf -- 'description: %s\n' "$desc"
-          printf -- '---\n\n'
-          printf -- 'Use Skill `%s` with arguments: $ARGUMENTS\n' "$name"
-        } > "$tmp"
-        if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
-          rm -f "$tmp"
-          continue
-        fi
-        if [[ -L "$dest" || ( -e "$dest" && ! -f "$dest" ) ]]; then
-          echo "error: $dest exists and is not a regular file — refuse to overwrite." >&2
-          rm -f "$tmp"
-          exit 1
-        fi
-        if [[ $DRY_RUN -eq 1 ]]; then
-          log "[dry-run] write wrapper $dest"
-          rm -f "$tmp"
-        else
-          mv "$tmp" "$dest"
-        fi
-        ;;
-      *)
-        echo "error: unknown target format '$fmt' for dir '$t'" >&2
-        exit 1
-        ;;
-    esac
   done
 done
 
-# --- Prune stale artifacts -----------------------------------------------
+# --- Prune stale symlinks -------------------------------------------------
 if [[ $PRUNE -eq 1 ]]; then
-  for i in "${!target_dirs[@]}"; do
-    t="${target_dirs[$i]}"
-    fmt="${target_formats[$i]}"
+  for t in "${targets[@]}"; do
     full="$ROOT/$t"
     [[ -d "$full" ]] || continue
-    case "$fmt" in
-      symlink)
-        while IFS= read -r -d '' link; do
-          keep=0
-          for m in "${managed_paths[@]}"; do
-            [[ "$link" == "$m" ]] && keep=1 && break
-          done
-          if [[ $keep -eq 0 ]]; then
-            target=$(readlink "$link" 2>/dev/null || true)
-            case "$target" in
-              "$SKILLS_HOME"/*) run "rm '$link'" ;;
-            esac
-          fi
-        done < <(find "$full" -maxdepth 1 -type l -print0)
-        ;;
-      command-wrapper)
-        # Prune only wrappers previously generated by sync-skills.
-        # Identify by first-line sentinel: the wrapper body contains
-        # `Use Skill \`<name>\` with arguments:` — match any such file.
-        while IFS= read -r -d '' f; do
-          keep=0
-          for m in "${managed_paths[@]}"; do
-            [[ "$f" == "$m" ]] && keep=1 && break
-          done
-          if [[ $keep -eq 0 ]]; then
-            if grep -q '^Use Skill `.*` with arguments: \$ARGUMENTS' "$f" 2>/dev/null; then
-              run "rm '$f'"
-            fi
-          fi
-        done < <(find "$full" -maxdepth 1 -type f -name '*.md' -print0)
-        ;;
-    esac
+    while IFS= read -r -d '' link; do
+      keep=0
+      for m in "${managed_paths[@]}"; do
+        [[ "$link" == "$m" ]] && keep=1 && break
+      done
+      if [[ $keep -eq 0 ]]; then
+        target=$(readlink "$link" 2>/dev/null || true)
+        case "$target" in
+          "$SKILLS_HOME"/*) run "rm '$link'" ;;
+        esac
+      fi
+    done < <(find "$full" -maxdepth 1 -type l -print0)
   done
 fi
 
-log "sync-skills: ${#skills[@]} skill(s) across ${#target_dirs[@]} target dir(s)."
+log "sync-skills: ${#skills[@]} skill(s) across ${#targets[@]} target dir(s)."
